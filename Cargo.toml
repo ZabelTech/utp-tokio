@@ -2,6 +2,10 @@
 name = "utp-tokio"
 version = "0.1.0"
 edition = "2021"
+license = "WTFPL"
+authors = ["Robert Zabel"]
+description = "libutp bindings for tokio"
+keywords = ["utp", "tokio"]
 
 [dependencies]
 libutp-sys = "0.1.4"
