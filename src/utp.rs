@@ -18,6 +18,7 @@ struct Buffer<T> {
 
 #[derive(Debug)]
 pub struct UtpSocket {
+    pub remote_address: SocketAddr,
     c_socket: *mut utp_socket,
     to_read:  Buffer<Vec<u8>>,
 }
@@ -93,11 +94,11 @@ impl UtpCtx {
         socket
     }
 
-    pub async fn connect(&self, addr: SocketAddr) -> Arc<UtpSocket> {
-        let utp_socket = UtpSocket::new(unsafe { utp_create_socket(self.c_ctx)});
+    pub async fn connect(&self, address: SocketAddr) -> Arc<UtpSocket> {
+        let utp_socket = UtpSocket::new(unsafe { utp_create_socket(self.c_ctx)}, address);
 
         let on_connect = Arc::new(Notify::new());
-        let addr : OsSocketAddr = addr.into();
+        let addr : OsSocketAddr = address.into();
 
         unsafe {
             utp_set_userdata(utp_socket.c_socket, Arc::into_raw(on_connect.clone()) as *mut c_void);
@@ -161,7 +162,15 @@ pub unsafe extern "C" fn on_connect(args: *mut utp_callback_arguments) -> u64 {
 #[no_mangle]
 pub unsafe extern "C" fn on_accept(args: *mut utp_callback_arguments) -> u64 {
     let ctx        = &*(utp_context_get_userdata((*args).context) as *const UtpCtx);
-    let utp_socket = UtpSocket::new((*args).socket);
+    let addr      = (*args).args1.address;
+    let addr_len  = (*args).args2.address_len;
+
+    let Some(remote) = OsSocketAddr::copy_from_raw(addr, addr_len).into_addr() else {
+        println!("error creating socketaddr");
+        todo!()
+    };
+
+    let utp_socket = UtpSocket::new((*args).socket,remote.into());
 
     if let Err(err) = ctx.incomming.write.try_send(utp_socket) {
         println!("error accpeting: {:?}",err);
@@ -212,11 +221,11 @@ async fn utp_listener(ctx: Arc<UtpCtx>, socket: Arc<UdpSocket>) {
 }
 
 impl UtpSocket {
-    pub fn new(c_socket: *mut utp_socket) -> Arc<UtpSocket> {
+    pub fn new(c_socket: *mut utp_socket, remote_address: SocketAddr) -> Arc<UtpSocket> {
         let (write,read) = mpsc::channel(100);
         let to_read      = Buffer {write, read : Arc::new(Mutex::new(read))};
 
-        let utp = Arc::new(UtpSocket{c_socket,to_read});
+        let utp = Arc::new(UtpSocket{remote_address,c_socket,to_read});
 
         unsafe {
             utp_set_userdata(utp.c_socket, Arc::into_raw(utp.clone()) as *mut c_void);
