@@ -1,0 +1,9 @@
+[package]
+name = "utp-tokio"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libutp-sys = "0.1.4"
+os_socketaddr = "0.2.5"
+tokio = { version = "1.38.1", default-features = false, features = ["net","sync","time","rt","macros"] }
