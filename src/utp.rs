@@ -55,7 +55,8 @@ impl UtpCtx {
             panic!("socket {:?} didn't become writable {:?}",address,err);
         }
 
-        let ctx = Arc::new(UtpCtx { address, incomming,
+        let ctx = Arc::new(UtpCtx { incomming,
+            address: listener.local_addr().unwrap(),
             socket: listener.clone(),
             c_ctx:  unsafe { utp_init(2) }
         });
