@@ -194,8 +194,7 @@ pub unsafe extern "C" fn log(args: *mut utp_callback_arguments) -> u64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn on_error(args: *mut utp_callback_arguments) -> u64 {
-    let str = CStr::from_ptr((*args).buf as *const i8);
-    println!("on error: {:?}",str);
+    println!("on error: {:?}",(*args).args1.error_code);
     0
 }
 
