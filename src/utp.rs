@@ -75,10 +75,10 @@ impl UtpCtx {
             utp_context_set_userdata(ctx.c_ctx, Arc::into_raw(ctx.clone()) as *mut c_void);
         }
 
-        let _handle = tokio::spawn(utp_listener(ctx.clone(),listener.clone()));
+        let _listener_handle = tokio::spawn(utp_listener(ctx.clone(),listener.clone()));
 
         let child_ctx = ctx.clone();
-        let _handle = tokio::spawn(async move {
+        let _timeout_handle = tokio::spawn(async move {
             loop {
                 unsafe { utp_check_timeouts(child_ctx.c_ctx) }
                 sleep(Duration::from_millis(500)).await;
