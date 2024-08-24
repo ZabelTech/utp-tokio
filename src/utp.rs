@@ -1,14 +1,18 @@
 use std::ffi::{CStr,c_void};
 use std::net::SocketAddr;
 use std::slice::from_raw_parts;
-use std::sync::Arc;
+use std::sync::{Arc,Weak};
 use os_socketaddr::OsSocketAddr;
 
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex,Notify,mpsc};
-use tokio::time::{Duration,sleep};
+use tokio::time::{Duration,sleep,timeout};
 
 use libutp_sys::*;
+
+pub enum UtpError {
+    SocketDestroyed
+}
 
 #[derive(Debug)]
 struct Buffer<T> {
@@ -26,19 +30,33 @@ pub struct UtpSocket {
 unsafe impl Send for UtpSocket {}
 unsafe impl Sync for UtpSocket {}
 
+impl Drop for UtpSocket {
+    fn drop(&mut self) {
+        unsafe { utp_close(self.c_socket) }
+    }
+}
+
 #[derive(Debug)]
 pub struct UtpCtx {
     pub address: SocketAddr,
     incomming:   Buffer<Arc<UtpSocket>>,
-    socket:      Arc<UdpSocket>,
-    c_ctx:       *mut utp_context,
+    socket:      UdpSocket,
+    c_ctx:       *mut utp_context
+}
+
+impl Drop for UtpCtx {
+    fn drop(&mut self) {
+        unsafe { utp_destroy(self.c_ctx) }
+    }
 }
 
 unsafe impl Send for UtpCtx {}
 unsafe impl Sync for UtpCtx {}
 
+pub struct Config {}
+
 impl UtpCtx {
-    pub async fn new(address: Option<SocketAddr>) -> Arc<UtpCtx> {
+    pub async fn new(address: Option<SocketAddr>,_config: Option<Config>) -> Arc<UtpCtx> {
         let default_address = "[::]:0".parse().unwrap();
         let address         = address.unwrap_or(default_address);
 
@@ -49,7 +67,8 @@ impl UtpCtx {
         if let Err(err) = listener {
             panic!("couldn't bind to {:?} because of {:?}",address,err);
         }
-        let listener = Arc::new(listener.unwrap());
+
+        let listener = listener.unwrap();
 
         if let Err(err) = listener.writable().await {
             panic!("socket {:?} didn't become writable {:?}",address,err);
@@ -57,8 +76,8 @@ impl UtpCtx {
 
         let ctx = Arc::new(UtpCtx { incomming,
             address: listener.local_addr().unwrap(),
-            socket: listener.clone(),
-            c_ctx:  unsafe { utp_init(2) }
+            socket:  listener,
+            c_ctx:   unsafe { utp_init(2) },
         });
 
         unsafe {
@@ -72,18 +91,12 @@ impl UtpCtx {
             utp_context_set_option(ctx.c_ctx, UTP_LOG_DEBUG as i32,  3);
             utp_context_set_option(ctx.c_ctx, UTP_LOG_NORMAL as i32, 3);
             utp_context_set_option(ctx.c_ctx, UTP_LOG_MTU as i32,    1);
-            utp_context_set_userdata(ctx.c_ctx, Arc::into_raw(ctx.clone()) as *mut c_void);
+
+            utp_context_set_userdata(ctx.c_ctx, Arc::as_ptr(&ctx) as *mut c_void);
         }
 
-        let _listener_handle = tokio::spawn(utp_listener(ctx.clone(),listener.clone()));
-
-        let child_ctx = ctx.clone();
-        let _timeout_handle = tokio::spawn(async move {
-            loop {
-                unsafe { utp_check_timeouts(child_ctx.c_ctx) }
-                sleep(Duration::from_millis(500)).await;
-            }
-        });
+        let _ = tokio::spawn(utp_listener(Arc::downgrade(&ctx)));
+        let _ = tokio::spawn(check_timeouts(Arc::downgrade(&ctx)));
 
         ctx
     }
@@ -102,7 +115,7 @@ impl UtpCtx {
         let addr : OsSocketAddr = address.into();
 
         unsafe {
-            utp_set_userdata(utp_socket.c_socket, Arc::into_raw(on_connect.clone()) as *mut c_void);
+            utp_set_userdata(utp_socket.c_socket, Arc::as_ptr(&on_connect) as *mut c_void);
 
             if utp_connect(utp_socket.c_socket, addr.as_ptr(), addr.len()) != 0 {
                 panic!("couldn't connect to: {:?}", addr)
@@ -112,21 +125,57 @@ impl UtpCtx {
         on_connect.notified().await;
 
         unsafe {
-            utp_set_userdata(utp_socket.c_socket, Arc::into_raw(utp_socket.clone()) as *mut c_void);
+            let socket_ptr = Arc::as_ptr(&utp_socket);
+            utp_set_userdata(utp_socket.c_socket, socket_ptr as *mut c_void);
         }
 
         utp_socket
     }
+}
 
+async fn check_timeouts(ctx: Weak<UtpCtx>) {
+    loop {
+        sleep(Duration::from_millis(500)).await;
+        let Some(ctx) = Weak::upgrade(&ctx) else { break };
+        unsafe { utp_check_timeouts(ctx.c_ctx) }
+    }
+}
+
+async fn utp_listener(ctx: Weak<UtpCtx>) {
+    let hundred_ms = Duration::from_millis(100);
+    loop {
+        let Some(ctx) = Weak::upgrade(&ctx) else { break };
+
+        let mut buffer = vec![0; 1024];
+        match timeout(hundred_ms,ctx.socket.recv_from(&mut buffer)).await {
+            Err(_)       => continue,
+            Ok(Err(err)) => {
+                println!("problem reading from socket: {:?}",err);
+                break;
+            },
+            Ok(Ok((n_bytes, remote_address))) => {
+                let c_addr : OsSocketAddr = remote_address.into();
+                unsafe {
+                    let ret = utp_process_udp(
+                        ctx.c_ctx,buffer.as_ptr(),n_bytes as u64,c_addr.as_ptr(),c_addr.len()
+                    );
+                    if ret != 1 {
+                        println!("got non utp packet")
+                    }
+                    utp_issue_deferred_acks(ctx.c_ctx);
+                };
+            }
+        }
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn on_read(args: *mut utp_callback_arguments) -> u64 {
-    let utp     = &*(utp_get_userdata((*args).socket) as *const UtpSocket);
+    let socket  = &*(utp_get_userdata((*args).socket) as *const UtpSocket);
     let payload = from_raw_parts((*args).buf, (*args).len as usize);
 
-    if let Err(err) = utp.to_read.write.try_send(payload.to_vec()) {
-        println!("error reading: {:?} {:?}",utp,err);
+    if let Err(err) = socket.to_read.write.try_send(payload.to_vec()) {
+        println!("error reading: {:?} {:?}",socket,err);
     }
     utp_read_drained((*args).socket);
     0
@@ -147,10 +196,8 @@ pub unsafe extern "C" fn on_sendto(args: *mut utp_callback_arguments) -> u64 {
 
     if let Err(err) = ctx.socket.try_send_to(&payload,dst) {
         println!("error sending : {:?}",err);
-        1
-    } else {
-        0
     }
+    0
 }
 
 #[no_mangle]
@@ -180,8 +227,14 @@ pub unsafe extern "C" fn on_accept(args: *mut utp_callback_arguments) -> u64 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn on_state_change(_args: *mut utp_callback_arguments) -> u64 {
-    println!("on state change");
+pub unsafe extern "C" fn on_state_change(args: *mut utp_callback_arguments) -> u64 {
+    match (*args).args1.state {
+        1 => println!("on state change: connect"),
+        2 => println!("on state change: writable"),
+        3 => println!("on state change: eof"),
+        4 => println!("on state change: destroyed"),
+        x => println!("on state change: {x}")
+    };
     0
 }
 
@@ -194,43 +247,26 @@ pub unsafe extern "C" fn log(args: *mut utp_callback_arguments) -> u64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn on_error(args: *mut utp_callback_arguments) -> u64 {
-    println!("on error: {:?}",(*args).args1.error_code);
+    match (*args).args1.error_code {
+        0 => println!("on error: UTP_ECONNREFUSED"),
+        1 => println!("on error: UTP_ECONNRESET"),
+        2 => println!("on error: UTP_ETIMEDOUT"),
+        x => println!("on error: {x}")
+    };
     0
-}
-
-async fn utp_listener(ctx: Arc<UtpCtx>, socket: Arc<UdpSocket>) {
-    loop {
-        let mut buffer = vec![0; 1024];
-        let (n_bytes, remote_address) = socket
-            .recv_from(&mut buffer)
-            .await
-            .expect("can't read from incomming udp connection");
-
-        let c_addr : OsSocketAddr = remote_address.into();
-
-        unsafe {
-            let ret = utp_process_udp(
-                ctx.c_ctx,buffer.as_ptr(),n_bytes as u64,c_addr.as_ptr(),c_addr.len()
-            );
-            if ret != 1 {
-                println!("got non utp packet")
-            }
-            utp_issue_deferred_acks(ctx.c_ctx);
-        };
-    }
 }
 
 impl UtpSocket {
     pub fn new(c_socket: *mut utp_socket, remote_address: SocketAddr) -> Arc<UtpSocket> {
         let (write,read) = mpsc::channel(100);
         let to_read      = Buffer {write, read : Arc::new(Mutex::new(read))};
-
-        let utp = Arc::new(UtpSocket{remote_address,c_socket,to_read});
+        let socket       = Arc::new(UtpSocket{remote_address,c_socket,to_read});
 
         unsafe {
-            utp_set_userdata(utp.c_socket, Arc::into_raw(utp.clone()) as *mut c_void);
+            utp_set_userdata(socket.c_socket, Arc::as_ptr(&socket) as *mut c_void);
         }
-        utp
+
+        socket
     }
 
     pub async fn write(&self, payload: &[u8]) -> usize {
@@ -238,10 +274,14 @@ impl UtpSocket {
         unsafe { utp_write(self.c_socket,payload_ptr,payload.len() as u64) as usize }
     }
 
-    pub async fn receive(&self) -> Vec<u8> {
+    pub async fn receive(&self) -> Result<Vec<u8>,UtpError> {
         loop {
+            println!("starting to receive");
             if let Some(res) = self.to_read.read.lock().await.recv().await {
-                break res;
+                break Ok(res);
+            } else {
+                println!("receive finished because socket is closed");
+                break Err(UtpError::SocketDestroyed);
             }
         }
     }
