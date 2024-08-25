@@ -41,7 +41,8 @@ pub struct UtpCtx {
     pub address: SocketAddr,
     incomming:   Buffer<Arc<UtpSocket>>,
     socket:      UdpSocket,
-    c_ctx:       *mut utp_context
+    c_ctx:       *mut utp_context,
+    lock:        Mutex<()>
 }
 
 impl Drop for UtpCtx {
@@ -78,7 +79,9 @@ impl UtpCtx {
             address: listener.local_addr().unwrap(),
             socket:  listener,
             c_ctx:   unsafe { utp_init(2) },
+            lock:    Mutex::new(())
         });
+
 
         unsafe {
             utp_set_callback(ctx.c_ctx,UTP_ON_READ as i32,Some(on_read));
@@ -92,7 +95,8 @@ impl UtpCtx {
             utp_context_set_option(ctx.c_ctx, UTP_LOG_NORMAL as i32, 3);
             utp_context_set_option(ctx.c_ctx, UTP_LOG_MTU as i32,    1);
 
-            utp_context_set_userdata(ctx.c_ctx, Arc::as_ptr(&ctx) as *mut c_void);
+            let ctx_ptr = Weak::into_raw(Arc::downgrade(&ctx));
+            utp_context_set_userdata(ctx.c_ctx, ctx_ptr as *mut c_void);
         }
 
         let _ = tokio::spawn(utp_listener(Arc::downgrade(&ctx)));
@@ -109,7 +113,10 @@ impl UtpCtx {
     }
 
     pub async fn connect(&self, address: SocketAddr) -> Arc<UtpSocket> {
-        let utp_socket = UtpSocket::new(unsafe { utp_create_socket(self.c_ctx)}, address);
+        let utp_socket = {
+            let _          = self.lock.lock().await;
+            UtpSocket::new(unsafe { utp_create_socket(self.c_ctx)}, address)
+        };
 
         let on_connect = Arc::new(Notify::new());
         let addr : OsSocketAddr = address.into();
@@ -125,7 +132,7 @@ impl UtpCtx {
         on_connect.notified().await;
 
         unsafe {
-            let socket_ptr = Arc::as_ptr(&utp_socket);
+            let socket_ptr = Weak::into_raw(Arc::downgrade(&utp_socket));
             utp_set_userdata(utp_socket.c_socket, socket_ptr as *mut c_void);
         }
 
@@ -147,8 +154,10 @@ async fn utp_listener(ctx: Weak<UtpCtx>) {
         let Some(ctx) = Weak::upgrade(&ctx) else { break };
 
         let mut buffer = vec![0; 1024];
+
         match timeout(hundred_ms,ctx.socket.recv_from(&mut buffer)).await {
-            Err(_)       => continue,
+            Err(_)         => continue,
+            Ok(Ok((0, _))) => continue,
             Ok(Err(err)) => {
                 println!("problem reading from socket: {:?}",err);
                 break;
@@ -156,6 +165,7 @@ async fn utp_listener(ctx: Weak<UtpCtx>) {
             Ok(Ok((n_bytes, remote_address))) => {
                 let c_addr : OsSocketAddr = remote_address.into();
                 unsafe {
+                    let _   = ctx.lock.lock().await;
                     let ret = utp_process_udp(
                         ctx.c_ctx,buffer.as_ptr(),n_bytes as u64,c_addr.as_ptr(),c_addr.len()
                     );
@@ -209,7 +219,7 @@ pub unsafe extern "C" fn on_connect(args: *mut utp_callback_arguments) -> u64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn on_accept(args: *mut utp_callback_arguments) -> u64 {
-    let ctx        = &*(utp_context_get_userdata((*args).context) as *const UtpCtx);
+    let ctx       = &*(utp_context_get_userdata((*args).context) as *const UtpCtx);
     let addr      = (*args).args1.address;
     let addr_len  = (*args).args2.address_len;
 
@@ -260,10 +270,12 @@ impl UtpSocket {
     pub fn new(c_socket: *mut utp_socket, remote_address: SocketAddr) -> Arc<UtpSocket> {
         let (write,read) = mpsc::channel(100);
         let to_read      = Buffer {write, read : Arc::new(Mutex::new(read))};
+        let lock         = Mutex::new(());
         let socket       = Arc::new(UtpSocket{remote_address,c_socket,to_read});
 
         unsafe {
-            utp_set_userdata(socket.c_socket, Arc::as_ptr(&socket) as *mut c_void);
+            let socket_ptr = Weak::into_raw(Arc::downgrade(&socket));
+            utp_set_userdata(socket.c_socket, socket_ptr as *mut c_void);
         }
 
         socket
@@ -276,7 +288,6 @@ impl UtpSocket {
 
     pub async fn receive(&self) -> Result<Vec<u8>,UtpError> {
         loop {
-            println!("starting to receive");
             if let Some(res) = self.to_read.read.lock().await.recv().await {
                 break Ok(res);
             } else {
